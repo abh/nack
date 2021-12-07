@@ -31,6 +31,11 @@ import (
 	k8sapi "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8smeta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klog "k8s.io/klog/v2"
+)
+
+const (
+	streamFinalizerKey = "streamfinalizer.jetstream.nats.io"
 )
 
 func (c *Controller) runStreamQueue() {
@@ -167,46 +172,62 @@ func (c *Controller) processStream(ns, name string, jsmc jsmClient) (err error) 
 		return nil
 	}
 
-	deleteOK := str.GetDeletionTimestamp() != nil
+	doDelete := str.GetDeletionTimestamp() != nil
 	newGeneration := str.Generation != str.Status.ObservedGeneration
 	strOK := true
 	err = natsClientUtil(streamExists)
-	var apierr jsmapi.ApiError
-	if errors.As(err, &apierr) && apierr.NotFoundError() {
+	if err != nil {
+		// Could be "not found" or real error. We'll find out which later.
 		strOK = false
-	} else if err != nil {
-		return err
 	}
-	updateOK := (strOK && !deleteOK && newGeneration)
-	createOK := (!strOK && !deleteOK && newGeneration)
+	doUpdate := (strOK && !doDelete && newGeneration)
+	doCreate := (!strOK && !doDelete && newGeneration)
 
 	switch {
-	case createOK:
+	case doCreate:
 		c.normalEvent(str, "Creating", fmt.Sprintf("Creating stream %q", spec.Name))
 		if err := natsClientUtil(createStream); err != nil {
 			return err
 		}
 
+		res, err := setStreamFinalizer(c.ctx, str, ifc)
+		if err != nil {
+			return err
+		}
+		str = res
+
 		if _, err := setStreamOK(c.ctx, str, ifc); err != nil {
 			return err
 		}
 		c.normalEvent(str, "Created", fmt.Sprintf("Created stream %q", spec.Name))
-	case updateOK:
+	case doUpdate:
 		c.normalEvent(str, "Updating", fmt.Sprintf("Updating stream %q", spec.Name))
 		if err := natsClientUtil(updateStream); err != nil {
 			return err
 		}
+
+		res, err := setStreamFinalizer(c.ctx, str, ifc)
+		if err != nil {
+			return err
+		}
+		str = res
 
 		if _, err := setStreamOK(c.ctx, str, ifc); err != nil {
 			return err
 		}
 		c.normalEvent(str, "Updated", fmt.Sprintf("Updated stream %q", spec.Name))
 		return nil
-	case deleteOK:
+	case doDelete:
 		c.normalEvent(str, "Deleting", fmt.Sprintf("Deleting stream %q", spec.Name))
 		if err := natsClientUtil(deleteStream); err != nil {
 			return err
 		}
+
+		if _, err := clearStreamFinalizer(c.ctx, str, ifc); err != nil {
+			return err
+		}
+
+		klog.Infof("Deleted stream %q", spec.Name)
 	default:
 		c.warningEvent(str, "Noop", fmt.Sprintf("Nothing done for stream %q", spec.Name))
 	}
@@ -437,6 +458,34 @@ func setStreamOK(ctx context.Context, s *apis.Stream, i typed.StreamInterface) (
 	res, err := i.UpdateStatus(ctx, sc, k8smeta.UpdateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to set stream %q status: %w", s.Spec.Name, err)
+	}
+
+	return res, nil
+}
+
+func setStreamFinalizer(ctx context.Context, o *apis.Stream, i typed.StreamInterface) (*apis.Stream, error) {
+	o.SetFinalizers(addFinalizer(o.GetFinalizers(), streamFinalizerKey))
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	res, err := i.Update(ctx, o, k8smeta.UpdateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to set %q stream finalizers: %w", o.GetName(), err)
+	}
+
+	return res, nil
+}
+
+func clearStreamFinalizer(ctx context.Context, o *apis.Stream, i typed.StreamInterface) (*apis.Stream, error) {
+	o.SetFinalizers(removeFinalizer(o.GetFinalizers(), streamFinalizerKey))
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	res, err := i.Update(ctx, o, k8smeta.UpdateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to clear %q stream finalizers: %w", o.GetName(), err)
 	}
 
 	return res, nil

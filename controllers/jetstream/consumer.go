@@ -19,6 +19,11 @@ import (
 	k8sapi "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	k8smeta "k8s.io/apimachinery/pkg/apis/meta/v1"
+	klog "k8s.io/klog/v2"
+)
+
+const (
+	consumerFinalizerKey = "consumerfinalizer.jetstream.nats.io"
 )
 
 func (c *Controller) runConsumerQueue() {
@@ -155,40 +160,50 @@ func (c *Controller) processConsumer(ns, name string, jsmc jsmClient) (err error
 		return nil
 	}
 
-	deleteOK := cns.GetDeletionTimestamp() != nil
+	doDelete := cns.GetDeletionTimestamp() != nil
 	newGeneration := cns.Generation != cns.Status.ObservedGeneration
 	consumerOK := true
 	err = natsClientUtil(consumerExists)
-	var apierr jsmapi.ApiError
-	if errors.As(err, &apierr) && apierr.NotFoundError() {
+	if err != nil {
+		// Could be "not found" or real error. We'll find out which later.
 		consumerOK = false
-	} else if err != nil {
-		return err
 	}
-	updateOK := (consumerOK && !deleteOK && newGeneration)
-	createOK := (!consumerOK && !deleteOK && newGeneration)
+	doUpdate := (consumerOK && !doDelete && newGeneration)
+	doCreate := (!consumerOK && !doDelete && newGeneration)
 
 	switch {
-	case createOK:
+	case doCreate:
 		c.normalEvent(cns, "Creating",
 			fmt.Sprintf("Creating consumer %q on stream %q", spec.DurableName, spec.StreamName))
 		if err := natsClientUtil(createConsumer); err != nil {
 			return err
 		}
 
+		res, err := setConsumerFinalizer(c.ctx, cns, ifc)
+		if err != nil {
+			return err
+		}
+		cns = res
+
 		if _, err := setConsumerOK(c.ctx, cns, ifc); err != nil {
 			return err
 		}
 		c.normalEvent(cns, "Created",
 			fmt.Sprintf("Created consumer %q on stream %q", spec.DurableName, spec.StreamName))
-	case updateOK:
+	case doUpdate:
 		c.warningEvent(cns, "Updating",
 			fmt.Sprintf("Consumer updates (%q on %q) are not allowed, recreate to update", spec.DurableName, spec.StreamName))
-	case deleteOK:
+	case doDelete:
 		c.normalEvent(cns, "Deleting", fmt.Sprintf("Deleting consumer %q on stream %q", spec.DurableName, spec.StreamName))
 		if err := natsClientUtil(deleteConsumer); err != nil {
 			return err
 		}
+
+		if _, err := clearConsumerFinalizer(c.ctx, cns, ifc); err != nil {
+			return err
+		}
+
+		klog.Infof("Deleted consumer %q on stream %q", spec.DurableName, spec.StreamName)
 	default:
 		c.warningEvent(cns, "Noop", fmt.Sprintf("Nothing done for consumer %q", spec.DurableName))
 	}
@@ -373,6 +388,34 @@ func setConsumerErrored(ctx context.Context, s *apis.Consumer, sif typed.Consume
 	res, err := sif.UpdateStatus(ctx, sc, k8smeta.UpdateOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to set consumer errored status: %w", err)
+	}
+
+	return res, nil
+}
+
+func setConsumerFinalizer(ctx context.Context, s *apis.Consumer, i typed.ConsumerInterface) (*apis.Consumer, error) {
+	s.SetFinalizers(addFinalizer(s.GetFinalizers(), consumerFinalizerKey))
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	res, err := i.Update(ctx, s, k8smeta.UpdateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to set finalizers for consumer %q: %w", s.Spec.DurableName, err)
+	}
+
+	return res, nil
+}
+
+func clearConsumerFinalizer(ctx context.Context, s *apis.Consumer, i typed.ConsumerInterface) (*apis.Consumer, error) {
+	s.SetFinalizers(removeFinalizer(s.GetFinalizers(), consumerFinalizerKey))
+
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	res, err := i.Update(ctx, s, k8smeta.UpdateOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to clear finalizers for consumer %q: %w", s.Spec.DurableName, err)
 	}
 
 	return res, nil

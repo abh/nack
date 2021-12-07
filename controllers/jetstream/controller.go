@@ -382,3 +382,37 @@ func eventHandlers(ctx context.Context, q workqueue.RateLimitingInterface) cache
 		},
 	}
 }
+
+// addFinalizer adds a finalizer key to a given set, only if it doesn't already
+// exist.
+func addFinalizer(fs []string, key string) []string {
+	for _, f := range fs {
+		if f == key {
+			return fs
+		}
+	}
+
+	return append(fs, key)
+}
+
+func removeFinalizer(fs []string, key string) []string {
+	var filtered []string
+	for _, f := range fs {
+		if f == key {
+			continue
+		}
+		filtered = append(filtered, f)
+	}
+
+	return filtered
+}
+
+func retry(n int, w time.Duration, fn func() error) error {
+	var err error
+	for i := 0; i < n; i++ {
+		if err = fn(); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("exhausted retries(%d,%s): %w", n, w, err)
+}

@@ -267,6 +267,7 @@ func TestProcessStream(t *testing.T) {
 
 		jsmc := &mockJsmClient{
 			loadStreamErr: errors.New("failed to load stream"),
+			newStreamErr: errors.New("failed to create stream"),
 		}
 		if err := ctrl.processStream(ns, name, jsmc); err == nil {
 			t.Fatal("unexpected success")

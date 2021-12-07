@@ -250,6 +250,7 @@ func TestProcessConsumer(t *testing.T) {
 
 		jsmc := &mockJsmClient{
 			loadConsumerErr: errors.New("failed to load consumer"),
+			newConsumerErr: errors.New("failed to create consumer"),
 		}
 		if err := ctrl.processConsumer(ns, name, jsmc); err == nil {
 			t.Fatal("unexpected success")
